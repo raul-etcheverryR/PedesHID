@@ -22,6 +22,7 @@
 #include "freertos/task.h"
 
 #include "esp_adc/adc_oneshot.h"
+#include "esp_timer.h"
 
 #if CONFIG_BT_SDP_COMMON_ENABLED
 #include "esp_sdp_api.h"
@@ -110,7 +111,13 @@ void send_mouse(uint8_t buttons, char dx, char dy, char wheel)
 #define HALL_A_D0 GPIO_NUM_19
 #define HALL_B_D0 GPIO_NUM_21
 
+int64_t ULTIMO_EVENTO_HALL_A = 0;
+int64_t ULTIMO_EVENTO_HALL_B = 0;
+
+const int64_t DEBOUNCE_US = 8000; // 8 ms
+
 QueueHandle_t FILA_HALL;
+
 
 typedef struct {
     int hall;
@@ -129,7 +136,7 @@ static void IRAM_ATTR hall_isr_handler(void *arg){
 }
 
 void botao_hall_teste(void *arg){
-    FILA_HALL = xQueueCreate( 10, sizeof(hall_event_t));
+    FILA_HALL = xQueueCreate( 128, sizeof(hall_event_t));
     hall_event_t EVENTO;
 
     gpio_config_t io_conf = {
@@ -159,36 +166,51 @@ void botao_hall_teste(void *arg){
 
     );
 
-    int HALL_A_PRESSIONADO = 0;
-    int HALL_B_PRESSIONADO = 0;
+    bool HALL_A_PRESSIONADO = false;
+    bool HALL_B_PRESSIONADO = false;
 
     while (1) {
         xQueueReceive( FILA_HALL, &EVENTO, portMAX_DELAY);
+        int64_t AGORA = esp_timer_get_time();
         printf( "HALL=%d ESTADO=%d\n", EVENTO.hall, EVENTO.estado);
 
         if(EVENTO.hall == 1){
-            if(EVENTO.estado == 1){
-                HALL_A_PRESSIONADO = 1; 
-                printf("A pressionado");
+            if(( AGORA - ULTIMO_EVENTO_HALL_A) < DEBOUNCE_US){
+                continue;
 
-            } else if(EVENTO.estado == 0 && HALL_A_PRESSIONADO == 1){
-                HALL_A_PRESSIONADO = 0;
+            }
+            ULTIMO_EVENTO_HALL_A = AGORA;
+
+            if(EVENTO.estado == 1 && !HALL_A_PRESSIONADO){
+                HALL_A_PRESSIONADO = true; 
                 send_mouse( 1, 0, 0, 0);
-                printf("CLIQUE ESQ");
+                printf("A pressionado\n");
+
+            } else if(EVENTO.estado == 0 && HALL_A_PRESSIONADO){
+                HALL_A_PRESSIONADO = false;
+                send_mouse( 0, 0, 0, 0);
+                printf("CLIQUE ESQ\n");
 
             }
 
         }
 
         if(EVENTO.hall == 2){
-            if(EVENTO.estado == 1){
-                HALL_B_PRESSIONADO = 1;
-                printf("B pressionado");    
+            if(( AGORA - ULTIMO_EVENTO_HALL_B) < DEBOUNCE_US){
+                continue;
 
-            } else if(EVENTO.estado == 0 && HALL_B_PRESSIONADO == 1){
-                HALL_B_PRESSIONADO = 0;
+            }
+            ULTIMO_EVENTO_HALL_B = AGORA;
+
+            if(EVENTO.estado == 1 && !HALL_B_PRESSIONADO){
+                HALL_B_PRESSIONADO = true;
                 send_mouse( 2, 0, 0, 0);
-                printf("CLIQUE DIR");
+                printf("B pressionado\n");  
+
+            } else if(EVENTO.estado == 0 && HALL_B_PRESSIONADO){
+                HALL_B_PRESSIONADO = false;
+                send_mouse( 0, 0, 0, 0);
+                printf("CLIQUE DIR\n");
 
             }
 
