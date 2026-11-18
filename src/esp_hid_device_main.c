@@ -1,3 +1,5 @@
+#include <math.h>
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,10 +24,10 @@
 #include "freertos/task.h"
 
 #include "esp_adc/adc_oneshot.h"
-#include "esp_timer.h"
+
+#include "esp_err.h"
 
 #if CONFIG_BT_SDP_COMMON_ENABLED
-#include "esp_sdp_api.h"
 #endif
 
 #include "esp_hidd.h"
@@ -88,277 +90,596 @@ static esp_hid_device_config_t bt_hid_config = {
     .vendor_id          = 0x16C0,
     .product_id         = 0x05DF,
     .version            = 0x0100,
-    .device_name        = "ESP BT HID1",
+    .device_name        = "Pedes HID",
     .manufacturer_name  = "Espressif",
     .serial_number      = "1234567890",
     .report_maps        = bt_report_maps,
     .report_maps_len    = 1
 };
 
-// send the buttons, change in x, and change in y
-void send_mouse(uint8_t buttons, char dx, char dy, char wheel)
+int BOTOES = 0;
+int DESLOC_EIXO_X = 0;
+int DESLOC_EIXO_Y = 0;
+
+// Identificador da tarefa de leitura dos sensores IR
+static TaskHandle_t ir_task_handle = NULL;
+
+// Envia um relatório HID: botoes, movimento X/Y e rolagem.
+// O buffer e local para evitar que tarefas diferentes sobrescrevam
+// o mesmo vetor enquanto montam seus relatorios.
+esp_err_t send_mouse(uint8_t buttons, int8_t dx, int8_t dy, int8_t wheel)
 {
-    static uint8_t buffer[4] = {0};
+    if (s_bt_hid_param.hid_dev == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
 
-    buffer[0] = buttons;
-    buffer[1] = dx;
-    buffer[2] = dy;
-    buffer[3] = wheel;
+    uint8_t buffer[4] = {
+        buttons,
+        (uint8_t)dx,
+        (uint8_t)dy,
+        (uint8_t)wheel
+    };
 
-    esp_hidd_dev_input_set(s_bt_hid_param.hid_dev, 0, 0, buffer, 4);
+    return esp_hidd_dev_input_set(
+        s_bt_hid_param.hid_dev, 0, 0, buffer, sizeof(buffer)
+    );
 }
 
-#define HALL_A_D0 GPIO_NUM_19
-#define HALL_B_D0 GPIO_NUM_21
+// Mapeamento dos pinos do Hall
+#define HALL_A_D0 GPIO_NUM_26
+#define HALL_B_D0 GPIO_NUM_27
 
-int64_t ULTIMO_EVENTO_HALL_A = 0;
-int64_t ULTIMO_EVENTO_HALL_B = 0;
+// Mapeamento dos pinos do IR
+#define IR_A_OUT GPIO_NUM_34
+#define IR_B_OUT GPIO_NUM_35
 
-const int64_t DEBOUNCE_US = 8000; // 8 ms
+QueueHandle_t FILA_HALL; // Fila responsável por armazenar eventos da interrupção
 
-QueueHandle_t FILA_HALL;
-
-
-typedef struct {
-    int hall;
+typedef struct { // Estrutura que representa o sensor que gerou o evento
+    int hall;    // e seu estado
     int estado;
 } hall_event_t;
 
-static void IRAM_ATTR hall_isr_handler(void *arg){
-    int HALL = (int)arg;
+static void IRAM_ATTR hall_isr_handler(void *arg){ // Rotina de serviço de interrupção ISR, executa
+                                                   // quando há mudança no nível lógico do pino
+    int HALL = (int)arg; // Identifica qual sensor gerou a interrupção
     hall_event_t EVENTO = {
-        .hall = HALL,
-        .estado = gpio_get_level( HALL == 1 ? HALL_A_D0 : HALL_B_D0)
+        .hall = HALL,       // Guarda sensor e estado em estrutura para a fila
+        .estado = gpio_get_level( HALL == 1 ? HALL_A_D0 : HALL_B_D0) // realiza a leitura do pino de acordo com
+                                                                     // argumento HALL recebido
     };
 
-    xQueueSendFromISR(FILA_HALL, &EVENTO, NULL);
-
+    xQueueSendFromISR(FILA_HALL, &EVENTO, NULL); // Enfileira estrutura na fila
 }
 
-void botao_hall_teste(void *arg){
-    FILA_HALL = xQueueCreate( 128, sizeof(hall_event_t));
-    hall_event_t EVENTO;
 
-    gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << HALL_A_D0 | 1ULL << HALL_B_D0),
+
+
+// Quantidade de transicoes validas para gerar uma unidade de rolagem.
+// 4 = um ciclo completo de quadratura por unidade HID.
+#define TRANSICOES_POR_ROLAGEM 4
+
+static void scroll_IR(void *arg)
+{
+    ESP_LOGI(TAG, "[IR] Iniciando encoder optico...");
+
+    gpio_config_t config = {
+        .pin_bit_mask = (1ULL << IR_A_OUT) | (1ULL << IR_B_OUT),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_ANYEDGE
-
+        .intr_type = GPIO_INTR_DISABLE
     };
 
-    gpio_config(&io_conf);
+    esp_err_t erro = gpio_config(&config);
 
+    if (erro != ESP_OK) {
+        ESP_LOGE(TAG, "[IR] Erro na configuracao: %s",
+                 esp_err_to_name(erro));
 
-    gpio_install_isr_service(0);
-    gpio_isr_handler_add(
-            HALL_A_D0,
-            hall_isr_handler,
-            (void *)1
-
-    );
-
-    gpio_isr_handler_add(
-        HALL_B_D0,
-        hall_isr_handler,
-        (void *)2
-
-    );
-
-    bool HALL_A_PRESSIONADO = false;
-    bool HALL_B_PRESSIONADO = false;
-
-    while (1) {
-        xQueueReceive( FILA_HALL, &EVENTO, portMAX_DELAY);
-        int64_t AGORA = esp_timer_get_time();
-        printf( "HALL=%d ESTADO=%d\n", EVENTO.hall, EVENTO.estado);
-
-        if(EVENTO.hall == 1){
-            if(( AGORA - ULTIMO_EVENTO_HALL_A) < DEBOUNCE_US){
-                continue;
-
-            }
-            ULTIMO_EVENTO_HALL_A = AGORA;
-
-            if(EVENTO.estado == 1 && !HALL_A_PRESSIONADO){
-                HALL_A_PRESSIONADO = true; 
-                send_mouse( 1, 0, 0, 0);
-                printf("A pressionado\n");
-
-            } else if(EVENTO.estado == 0 && HALL_A_PRESSIONADO){
-                HALL_A_PRESSIONADO = false;
-                send_mouse( 0, 0, 0, 0);
-                printf("CLIQUE ESQ\n");
-
-            }
-
-        }
-
-        if(EVENTO.hall == 2){
-            if(( AGORA - ULTIMO_EVENTO_HALL_B) < DEBOUNCE_US){
-                continue;
-
-            }
-            ULTIMO_EVENTO_HALL_B = AGORA;
-
-            if(EVENTO.estado == 1 && !HALL_B_PRESSIONADO){
-                HALL_B_PRESSIONADO = true;
-                send_mouse( 2, 0, 0, 0);
-                printf("B pressionado\n");  
-
-            } else if(EVENTO.estado == 0 && HALL_B_PRESSIONADO){
-                HALL_B_PRESSIONADO = false;
-                send_mouse( 0, 0, 0, 0);
-                printf("CLIQUE DIR\n");
-
-            }
-
-        }
-
+        ir_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
     }
 
+    // Estados: 00 -> 01 -> 11 -> 10 -> 00.
+    // Cada transicao valida soma +1 ou -1, conforme o sentido.
+    static const int transicoes[16] = {
+         0,  1, -1,  0,
+        -1,  0,  0,  1,
+         1,  0,  0, -1,
+         0, -1,  1,  0
+    };
+
+    int a = gpio_get_level(IR_A_OUT);
+    int b = gpio_get_level(IR_B_OUT);
+    int estado_anterior = (a << 1) | b;
+    int passos = 0;
+
+    ESP_LOGI(TAG, "[ENCODER] Estado inicial: A=%d B=%d", a, b);
+    ESP_LOGI(TAG, "[SCROLL] Encoder pronto. Uma unidade a cada %d transicoes.",
+             TRANSICOES_POR_ROLAGEM);
+
+    while (1) {
+        a = gpio_get_level(IR_A_OUT);
+        b = gpio_get_level(IR_B_OUT);
+
+        int estado_atual = (a << 1) | b;
+
+        if (estado_atual != estado_anterior) {
+            int indice = (estado_anterior << 2) | estado_atual;
+            int delta = transicoes[indice];
+
+            if (delta == 0) {
+                // Transicao diagonal: os dois bits mudaram entre leituras.
+                // Nao e possivel determinar o sentido com seguranca.
+                ESP_LOGW(TAG,
+                         "[ENCODER] Transicao invalida: %d%d -> %d%d",
+                         (estado_anterior >> 1) & 1,
+                         estado_anterior & 1,
+                         a, b);
+                passos = 0;
+            } else {
+                passos += delta;
+
+                if (passos >= TRANSICOES_POR_ROLAGEM) {
+                    passos -= TRANSICOES_POR_ROLAGEM;
+
+                    // No HID, valor positivo representa rolar para frente/cima.
+                    esp_err_t envio = send_mouse((uint8_t)BOTOES, 0, 0, 1);
+
+                    if (envio == ESP_OK) {
+                        ESP_LOGI(TAG, "[SCROLL] Rolagem para cima (+1)");
+                    } else {
+                        ESP_LOGW(TAG, "[SCROLL] Falha ao enviar rolagem: %s",
+                                 esp_err_to_name(envio));
+                    }
+                } else if (passos <= -TRANSICOES_POR_ROLAGEM) {
+                    passos += TRANSICOES_POR_ROLAGEM;
+
+                    // No HID, valor negativo representa rolar para tras/baixo.
+                    esp_err_t envio = send_mouse((uint8_t)BOTOES, 0, 0, -1);
+
+                    if (envio == ESP_OK) {
+                        ESP_LOGI(TAG, "[SCROLL] Rolagem para baixo (-1)");
+                    } else {
+                        ESP_LOGW(TAG, "[SCROLL] Falha ao enviar rolagem: %s",
+                                 esp_err_to_name(envio));
+                    }
+                }
+            }
+
+            estado_anterior = estado_atual;
+        }
+
+        // Manter 10 ms: esta temporizacao ja foi testada sem watchdog.
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
 }
 
-#define ANALOG_EIXO_X GPIO_NUM_2
-#define ANALOG_EIXO_Y  GPIO_NUM_15
+// Função de leitura dos botões hall (esq & dir)
+#define HALL_DEBOUNCE_MS 20
+void botao_hall(void *arg) {
+    FILA_HALL = xQueueCreate(64, sizeof(hall_event_t)); // Cria a fila na task
+    hall_event_t EVENTO;                                // Cria estrutura de eventos
+    int estado_anterior_A = -1;                         // Inicia variaveis de 
+    int estado_anterior_B = -1;                         // estado anterior
 
-void cursor_analog_teste(void *arg){
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << HALL_A_D0) | (1ULL << HALL_B_D0), // Mascara para representação de ambos pinos
+        .mode = GPIO_MODE_INPUT,   // seleciona pinos como entradas digitais
+        .pull_up_en = GPIO_PULLUP_DISABLE, // desabilita pull-up
+        .pull_down_en = GPIO_PULLDOWN_DISABLE, // desabilita pull-down
+        .intr_type = GPIO_INTR_ANYEDGE // Gera interrupção suba e queda do sinal logico
+    };
 
-    printf("ENTREI NA TASK DO JOYSTICK\n");
+    gpio_config(&io_conf); // aplica configurações anteriores de io_conf
+    gpio_install_isr_service(0); // Habilita interrupções
 
-    adc_oneshot_unit_handle_t adc_handle_analog;
-    adc_oneshot_unit_init_cfg_t init_config_analog = {.unit_id = ADC_UNIT_2, };
-    adc_oneshot_new_unit( &init_config_analog, &adc_handle_analog);
-    adc_oneshot_chan_cfg_t config_analog = { .bitwidth = ADC_BITWIDTH_12, .atten = ADC_ATTEN_DB_12, };
-    adc_oneshot_config_channel( adc_handle_analog, ADC_CHANNEL_2, &config_analog);
-    adc_oneshot_config_channel( adc_handle_analog, ADC_CHANNEL_3, &config_analog);
+    gpio_isr_handler_add( HALL_A_D0, hall_isr_handler, (void *)1); // Associa hall_isr_handler ao sensor A - argumento 1 na chamada da ISR
+    gpio_isr_handler_add( HALL_B_D0, hall_isr_handler, (void *)2); // O mesmo ao sensor B - argumento 2 na chamada da ISR
 
-    int VALOR_X;
-    int VALOR_Y;
+    while (1) {
+        xQueueReceive(FILA_HALL, &EVENTO, portMAX_DELAY);
+        gpio_num_t pino = (EVENTO.hall == 1) // Identifica o pino correspondente
+            ? HALL_A_D0
+            : HALL_B_D0;
 
-    int DESLOC_EIXO_X;
-    int DESLOC_EIXO_Y;
+        vTaskDelay(pdMS_TO_TICKS(HALL_DEBOUNCE_MS)); // Aguarda para permitir que o sinal estabilize
+
+        int estado_atual = gpio_get_level(pino); // Lê novamente o nível físico do sensor
+
+        if (estado_atual != EVENTO.estado) { // Se o sinal mudou durante a espera, descarta o evento
+            continue;
+        }
+        int *estado_anterior = (EVENTO.hall == 1) // Filtra eventos repetidos
+            ? &estado_anterior_A
+            : &estado_anterior_B;
+
+        if (EVENTO.estado == *estado_anterior) { // Se o sinal mantém-se o mesmo descarta o processamento
+            continue;
+        }
+
+        *estado_anterior = EVENTO.estado; // Atualiza estado_anterior
+
+        printf("HALL=%d ESTADO=%d\n",
+               EVENTO.hall, EVENTO.estado);
+
+        if (EVENTO.hall == 1) { // Verifica se o evento pretence ao sensor A
+            if (EVENTO.estado == 1) {   // Caso estado estja em 1 BOTOES (argumento do relatorio HID) 
+                BOTOES = 1;             // é setado para 1
+                send_mouse( BOTOES, DESLOC_EIXO_X, DESLOC_EIXO_Y, 0); // Envio do relatório HID com o estado das variaveis compartilhadas/globais (cursor_analog)
+                printf("PRESSIONANDO ESQ\n");
+            } else if (BOTOES == 1) {   // Caso esteja em 1 é setado para 0
+                BOTOES = 0;             // e o ciclo de clique e finalizado
+                send_mouse( BOTOES, DESLOC_EIXO_X, DESLOC_EIXO_Y, 0);// Envio do relatório HID
+                printf("CLIQUE ESQ\n");
+            }
+        } else if (EVENTO.hall == 2) {  // Mesmo tratamento para o sensor B
+            if (EVENTO.estado == 1) {
+                BOTOES = 2;
+                send_mouse( BOTOES, DESLOC_EIXO_X, DESLOC_EIXO_Y, 0); // Envio do relatório HID
+                printf("PRESSIONANDO DIR\n");
+            } else if (BOTOES == 2) {
+                BOTOES = 0;
+                send_mouse( BOTOES, DESLOC_EIXO_X, DESLOC_EIXO_Y, 0); // Envio do relatório HID
+                printf("CLIQUE DIR\n");
+            }
+        }
+    }
+}
+
+// Função de leitura do joystick cursor
+#define CENTRO_X 2048.0f // Valor central do eixo X do joystick
+#define CENTRO_Y 2048.0f // Valor central do eixo Y do joystick
+#define DEADZONE 0.2f //0.3121f // Valor da deadzone radial, 0.3121f corresponde a 32% do valor máximo do eixo (4095)
+void cursor_analog(void *arg){
+    adc_oneshot_unit_handle_t adc_handle_analog; // declara o identificador para unidade ADC
+    adc_oneshot_unit_init_cfg_t init_config_analog = {.unit_id = ADC_UNIT_1, }; // Seleciona a unidade ADC1 do ESP-32
+    adc_oneshot_new_unit( &init_config_analog, &adc_handle_analog); // inicia a unidade ADC selecionada e atribui o identificador
+                                                                    // adc_handle_analog já declarado
+    adc_oneshot_chan_cfg_t config_analog = { .bitwidth = ADC_BITWIDTH_12, .atten = ADC_ATTEN_DB_12, }; // Defnine configurações
+                                                                        // de leitura dos canais: 12 bits (0 - 4095)
+    adc_oneshot_config_channel( adc_handle_analog, ADC_CHANNEL_4, &config_analog); // Configura canal ADC4 para leitura analógica
+    adc_oneshot_config_channel( adc_handle_analog, ADC_CHANNEL_5, &config_analog); // O mesmo para canal ADC5 - (Pinos GPIO: 32, 33)
+
+    int VALOR_X = 0;
+    int VALOR_Y = 0;
 
     printf("X = %d | Y = %d\n", VALOR_X, VALOR_Y);
 
     while(1){
+        adc_oneshot_read(adc_handle_analog, ADC_CHANNEL_4, &VALOR_X); // Leitura do canal correspondente ao eixo X
+        adc_oneshot_read(adc_handle_analog, ADC_CHANNEL_5, &VALOR_Y); // Leitura de Y
 
-        adc_oneshot_read(adc_handle_analog, ADC_CHANNEL_2, &VALOR_X);
-        adc_oneshot_read(adc_handle_analog, ADC_CHANNEL_3, &VALOR_Y);
+        // Centralização e normalização
+        float X = (VALOR_X - CENTRO_X) / CENTRO_X;
+        float Y = (VALOR_Y - CENTRO_Y) / CENTRO_Y;
 
-        if( VALOR_X <= 1000){
-            DESLOC_EIXO_X = -2;
+        // Módulo do vetor
+        float MODULO = sqrtf(X * X + Y * Y);
 
-        } else if ( VALOR_X >= 3000){
-            DESLOC_EIXO_X =  2;
+        // Verificação da deadzone radial
+        if (MODULO <= DEADZONE) {
+            DESLOC_EIXO_X = 0;
+            DESLOC_EIXO_Y = 0;
 
         } else {
-            DESLOC_EIXO_X = 0;
+            
+            int INTENSIDADE;
+
+            if (MODULO < DEADZONE) {
+                INTENSIDADE = 1;
+            } else if (MODULO < 0.4f) {
+                INTENSIDADE = 2;
+            } else if (MODULO < 0.55f) {
+                INTENSIDADE = 3;
+            } else if (MODULO < 0.7f) {
+                INTENSIDADE = 4;
+            } else if (MODULO < 0.8f) {
+                INTENSIDADE = 5;
+            } else if (MODULO < 0.9f) {
+                INTENSIDADE = 6;
+            } else {
+                INTENSIDADE = 7;
+            }
+
+            float PROPORCAO_X = ( X/MODULO)/ 7.f;
+            float PROPORCAO_Y = ( Y/MODULO)/ 7.f;
+            float MOD_PROPORCAO_X = sqrtf( PROPORCAO_X * PROPORCAO_X);
+            float MOD_PROPORCAO_Y = sqrtf( PROPORCAO_Y * PROPORCAO_Y);
+
+            MOD_PROPORCAO_X *= INTENSIDADE;
+            MOD_PROPORCAO_Y *= INTENSIDADE;
+
+            if( MOD_PROPORCAO_X >= 0.9f){
+                DESLOC_EIXO_X = 7;
+            } else if( MOD_PROPORCAO_X >= 0.8f){
+                DESLOC_EIXO_X = 6;
+            } else if( MOD_PROPORCAO_X >= 0.7f){
+                DESLOC_EIXO_X = 5;
+            } else if( MOD_PROPORCAO_X >= 0.55f){
+                DESLOC_EIXO_X = 4;
+            } else if( MOD_PROPORCAO_X >= 0.4f){
+                DESLOC_EIXO_X = 3;
+            } else if( MOD_PROPORCAO_X >= 0.3f){
+                DESLOC_EIXO_X = 2;
+            } else if( MOD_PROPORCAO_X >= 0.01F){
+                DESLOC_EIXO_X = 1;
+            } else {
+                DESLOC_EIXO_X = 0;
+            }
+
+            if( MOD_PROPORCAO_Y >= 0.9f){
+                DESLOC_EIXO_Y = 7;
+            } else if( MOD_PROPORCAO_Y >= 0.8f){
+                DESLOC_EIXO_Y = 6;
+            } else if( MOD_PROPORCAO_Y >= 0.7f){
+                DESLOC_EIXO_Y = 5;
+            } else if( MOD_PROPORCAO_Y >= 0.55f){
+                DESLOC_EIXO_Y = 4;
+            } else if( MOD_PROPORCAO_Y >= 0.4f){
+                DESLOC_EIXO_Y = 3;
+            } else if( MOD_PROPORCAO_Y >= 0.3f){
+                DESLOC_EIXO_Y = 2;
+            } else if( MOD_PROPORCAO_Y >= 0.01F){
+                DESLOC_EIXO_Y = 1;
+            } else {
+                DESLOC_EIXO_Y = 0;
+            }
+
+            if( PROPORCAO_X < 0){
+                DESLOC_EIXO_X = -DESLOC_EIXO_X;
+            }
+
+            if( PROPORCAO_Y < 0){
+                DESLOC_EIXO_Y = -DESLOC_EIXO_Y;
+            }
 
         }
         
-        if( VALOR_Y <= 1000){
-            DESLOC_EIXO_Y = -2;
-
-        } else if ( VALOR_Y >= 3000){
-            DESLOC_EIXO_Y =  2;
-
-        } else {
-            DESLOC_EIXO_Y = 0;
-
-        }
-
-        //send_mouse( 0, DESLOC_EIXO_X, DESLOC_EIXO_Y, 0);
-        vTaskDelay(10 / portTICK_PERIOD_MS);
+        send_mouse(BOTOES, DESLOC_EIXO_X, DESLOC_EIXO_Y, 0);
+        vTaskDelay(10/ portTICK_PERIOD_MS); // Libera CPU por no mínimo 20 ms
     }
 }
 
-void bt_hid_demo_task(void *pvParameters)
+//
+//// Função de leitura do joystick cursor
+//#define CENTRO_X 2048.0f // Valor central do eixo X do joystick
+//#define CENTRO_Y 2048.0f // Valor central do eixo Y do joystick
+//#define DEADZONE 0.2f //0.3121f // Valor da deadzone radial, 0.3121f corresponde a 32% do valor máximo do eixo (4095)
+//void cursor_analog(void *arg){
+//    adc_oneshot_unit_handle_t adc_handle_analog; // declara o identificador para unidade ADC
+//    adc_oneshot_unit_init_cfg_t init_config_analog = {.unit_id = ADC_UNIT_1, }; // Seleciona a unidade ADC1 do ESP-32
+//    adc_oneshot_new_unit( &init_config_analog, &adc_handle_analog); // inicia a unidade ADC selecionada e atribui o identificador
+//                                                                    // adc_handle_analog já declarado
+//    adc_oneshot_chan_cfg_t config_analog = { .bitwidth = ADC_BITWIDTH_12, .atten = ADC_ATTEN_DB_12, }; // Defnine configurações
+//                                                                        // de leitura dos canais: 12 bits (0 - 4095)
+//    adc_oneshot_config_channel( adc_handle_analog, ADC_CHANNEL_4, &config_analog); // Configura canal ADC4 para leitura analógica
+//    adc_oneshot_config_channel( adc_handle_analog, ADC_CHANNEL_5, &config_analog); // O mesmo para canal ADC5 - (Pinos GPIO: 32, 33)
+//
+//    int VALOR_X = 0;
+//    int VALOR_Y = 0;
+//    int RESTO_X = 0;
+//    int RESTO_Y = 0;
+//
+//    printf("X = %d | Y = %d\n", VALOR_X, VALOR_Y);
+//
+//    while(1){
+//        adc_oneshot_read(adc_handle_analog, ADC_CHANNEL_4, &VALOR_X); // Leitura do canal correspondente ao eixo X
+//        adc_oneshot_read(adc_handle_analog, ADC_CHANNEL_5, &VALOR_Y); // Leitura de Y
+//
+//        // Centralização e normalização
+//        float X = (VALOR_X - CENTRO_X) / CENTRO_X;
+//        float Y = (VALOR_Y - CENTRO_Y) / CENTRO_Y;
+//
+//        // Módulo do vetor
+//        float MODULO = sqrtf(X * X + Y * Y);
+//
+//        // Verificação da deadzone radial
+//        if (MODULO <= DEADZONE) {
+//            DESLOC_EIXO_X = 0;
+//            DESLOC_EIXO_Y = 0;
+//            RESTO_X = 0;
+//            RESTO_Y = 0;
+//
+//        } else {
+//            
+//            int INTENSIDADE;
+//
+//            if (MODULO < 0.3f) {
+//                INTENSIDADE = 1;
+//            } else if (MODULO < 0.4f) {
+//                INTENSIDADE = 2;
+//            } else if (MODULO < 0.5f) {
+//                INTENSIDADE = 3;
+//            } else if (MODULO < 0.6f) {
+//                INTENSIDADE = 4;
+//            } else if (MODULO < 0.7f) {
+//                INTENSIDADE = 5;
+//            } else if (MODULO < 0.8f) {
+//                INTENSIDADE = 6;
+//            } else if (MODULO < 0.9f) {
+//                INTENSIDADE = 7;
+//            } else if (MODULO < 0.95f) {
+//                INTENSIDADE = 8;
+//            } else {
+//                INTENSIDADE = 9;
+//            }
+//
+//            float PROPORCAO_X = ( X/MODULO)/ 9.f;
+//            float PROPORCAO_Y = ( Y/MODULO)/ 9.f;
+//            float MOD_PROPORCAO_X = sqrtf( PROPORCAO_X * PROPORCAO_X);
+//            float MOD_PROPORCAO_Y = sqrtf( PROPORCAO_Y * PROPORCAO_Y);
+//
+//            MOD_PROPORCAO_X *= INTENSIDADE;
+//            MOD_PROPORCAO_Y *= INTENSIDADE;
+//
+//            if( MOD_PROPORCAO_X >= 0.90f){
+//                DESLOC_EIXO_X = 9;
+//            } else if( MOD_PROPORCAO_X >= 0.80f){
+//                DESLOC_EIXO_X = 8;
+//            } else if( MOD_PROPORCAO_X >= 0.70f){
+//                DESLOC_EIXO_X = 7;
+//            } else if( MOD_PROPORCAO_X >= 0.60f){
+//                DESLOC_EIXO_X = 6;
+//            } else if( MOD_PROPORCAO_X >= 0.50f){
+//                DESLOC_EIXO_X = 5;
+//            } else if( MOD_PROPORCAO_X >= 0.40f){
+//                DESLOC_EIXO_X = 4;
+//            } else if( MOD_PROPORCAO_X >= 0.30f){
+//                DESLOC_EIXO_X = 3;
+//            } else if( MOD_PROPORCAO_X >= 0.20f){
+//                DESLOC_EIXO_X = 2;
+//            } else if( MOD_PROPORCAO_X > 0.10f){
+//                DESLOC_EIXO_X = 1;
+//            }
+//
+//            if( MOD_PROPORCAO_Y >= 0.90f){
+//                DESLOC_EIXO_Y = 9;
+//            } else if( MOD_PROPORCAO_Y >= 0.80f){
+//                DESLOC_EIXO_Y = 8;
+//            } else if( MOD_PROPORCAO_Y >= 0.70f){
+//                DESLOC_EIXO_Y = 7;
+//            } else if( MOD_PROPORCAO_Y >= 0.60f){
+//                DESLOC_EIXO_Y = 6;
+//            } else if( MOD_PROPORCAO_Y >= 0.50f){
+//                DESLOC_EIXO_Y = 5;
+//            } else if( MOD_PROPORCAO_Y >= 0.40f){
+//                DESLOC_EIXO_Y = 4;
+//            } else if( MOD_PROPORCAO_Y >= 0.30f){
+//                DESLOC_EIXO_Y = 3;
+//            } else if( MOD_PROPORCAO_Y >= 0.20f){
+//                DESLOC_EIXO_Y = 2;
+//            } else if( MOD_PROPORCAO_Y > 0.10f){
+//                DESLOC_EIXO_Y = 1;
+//            }
+//
+//            if( PROPORCAO_X < 0){
+//                DESLOC_EIXO_X = -DESLOC_EIXO_X;
+//            }
+//
+//            if( PROPORCAO_Y < 0){
+//                DESLOC_EIXO_Y = -DESLOC_EIXO_Y;
+//            }
+////
+////            DESLOC_EIXO_X += RESTO_X;
+////            DESLOC_EIXO_Y += RESTO_Y;
+////
+////            // Sentido negativo
+////            if (VALOR_Y <= 500){
+////                DESLOC_EIXO_Y = -3;
+////                RESTO_Y += VALOR_Y - 500;
+////
+////            } else if (VALOR_Y < 1000){
+////                DESLOC_EIXO_Y = -2;
+////                RESTO_Y += VALOR_Y - 1000;
+////
+////            } else if(VALOR_Y < 1500){
+////                DESLOC_EIXO_Y = -1;
+////                RESTO_Y += VALOR_Y - 1500;
+////
+////            } else if (VALOR_Y <= 2500){ // Zona morta
+////                DESLOC_EIXO_Y = 0;
+////                RESTO_Y = 0;
+////
+////            } else if (VALOR_Y <= 3000){ // Sentido positivo
+////                DESLOC_EIXO_Y = 1;
+////                RESTO_Y += VALOR_Y - 2501;
+////
+////            } else if (VALOR_Y <= 3500){
+////                DESLOC_EIXO_Y = 2;
+////                RESTO_Y += VALOR_Y - 3001;
+////
+////            } else if (VALOR_Y > 3500){
+////                DESLOC_EIXO_Y = 3;
+////                RESTO_Y += VALOR_Y - 3501;
+////
+////            }
+////
+////            // Sentido negativo
+////            if (VALOR_X <= 500){
+////                DESLOC_EIXO_X = -3;
+////                RESTO_X += VALOR_X - 500;
+////
+////            } else if (VALOR_X < 1000){
+////                DESLOC_EIXO_X = -2;
+////                RESTO_X += VALOR_X - 1000;
+////
+////            } else if(VALOR_X < 1500){
+////                DESLOC_EIXO_X = -1;
+////                RESTO_X += VALOR_X - 1500;
+////
+////            } else if (VALOR_X <= 2500){ // Zona morta
+////                DESLOC_EIXO_X = 0;
+////                RESTO_X = 0;
+////
+////            } else if (VALOR_X <= 3000){ // Sentido positivo
+////                DESLOC_EIXO_X = 1;
+////                RESTO_X += VALOR_X - 2501;
+////
+////            } else if (VALOR_X <= 3500){
+////                DESLOC_EIXO_X = 2;
+////                RESTO_X += VALOR_X - 3001;
+////
+////            } else if (VALOR_X > 3500){
+////                DESLOC_EIXO_X = 3;
+////                RESTO_X += VALOR_X - 3501;
+////
+////            }
+//        }
+//        
+//        send_mouse(BOTOES, DESLOC_EIXO_X, DESLOC_EIXO_Y, 0);
+//        vTaskDelay(10 / portTICK_PERIOD_MS); // Libera CPU por no mínimo 10 ms
+//    }
+//}
+//
+void cursor_analog_task_start(void){ // Configuração da task cursor_analog_teste
+    xTaskCreate(cursor_analog, "cursor_analog", 2 * 1024, NULL, configMAX_PRIORITIES - 3, NULL);
+    return;
+}
+
+void botao_hall_task_start(void){ // Configuração da task botao_hall_teste | dps tem que tirar esse "teste" do nome delas kkk
+    xTaskCreate( botao_hall, "botao_hall", 2 * 1024, NULL, configMAX_PRIORITIES - 3, NULL);
+    return;
+}
+
+void scroll_IR_task_start(void)
 {
-    static const char* help_string = "########################################################################\n"\
-    "BT hid mouse demo usage:\n"\
-    "You can input these value to simulate mouse: 'q', 'w', 'e', 'a', 's', 'd', 'h'\n"\
-    "q -- click the left key\n"\
-    "w -- move up\n"\
-    "e -- click the right key\n"\
-    "a -- move left\n"\
-    "s -- move down\n"\
-    "d -- move right\n"\
-    "h -- show the help\n"\
-    "########################################################################\n";
+    printf("[IR] Solicitando criacao da tarefa...\n");
 
-    printf("%s\n", help_string);
+    if (ir_task_handle != NULL) {
+        printf("[IR] A tarefa ja foi criada.\n");
+        return;
+    }
 
-    char c;
+    BaseType_t resultado = xTaskCreate(
+        scroll_IR,
+        "scroll_IR",
+        3072,
+        NULL,
+        5,
+        &ir_task_handle
+    );
 
-    while (1) {
-        c = fgetc(stdin);
-
-        switch (c) {
-        case 'q':
-            send_mouse(1, 0, 0, 0);
-            break;
-
-        case 'w':
-            send_mouse(0, 0, -10, 0);
-            break;
-
-        case 'e':
-            send_mouse(2, 0, 0, 0);
-            break;
-
-        case 'a':
-            send_mouse(0, -10, 0, 0);
-            break;
-
-        case 's':
-            send_mouse(0, 0, 10, 0);
-            break;
-
-        case 'd':
-            send_mouse(0, 10, 0, 0);
-            break;
-
-        case 'h':
-            printf("%s\n", help_string);
-            break;
-
-        default:
-            break;
-        }
-
-        vTaskDelay(10 / portTICK_PERIOD_MS);
+    if (resultado == pdPASS) {
+        printf("[IR] Tarefa criada com sucesso!\n");
+    } else {
+        ir_task_handle = NULL;
+        printf("[IR] ERRO: nao foi possivel criar a tarefa!\n");
     }
 }
 
-
-void cursor_analog_teste_task_start(void){
-    xTaskCreate(cursor_analog_teste, "cursor_analog_teste", 2 * 1024, NULL, configMAX_PRIORITIES - 3, NULL);
-    return;
-}
-
-void botao_hall_teste_task_start(void){
-    xTaskCreate( botao_hall_teste, "botao_hall_teste", 2 * 1024, NULL, configMAX_PRIORITIES - 3, NULL);
-    return;
-}
-
-void bt_hid_task_start_up(void)
-{
-    xTaskCreate(bt_hid_demo_task, "bt_hid_demo_task", 2 * 1024, NULL, configMAX_PRIORITIES - 3, &s_bt_hid_param.task_hdl);
-    return;
-}
-
-void bt_hid_task_shut_down(void)
-{
+void bt_hid_task_shut_down(void) // aqui faz parte do exemplo mas acho que é o procedimento quando tu encerra a conexão bluetooth, seta as flags que são lidas em outros trechos do código
+{                                // É uma função não uma task
     if (s_bt_hid_param.task_hdl) {
         vTaskDelete(s_bt_hid_param.task_hdl);
         s_bt_hid_param.task_hdl = NULL;
     }
 }
 
-static void bt_hidd_event_callback(void *handler_args, esp_event_base_t base, int32_t id, void *event_data)
-{
+static void bt_hidd_event_callback(void *handler_args, esp_event_base_t base, int32_t id, void *event_data) // Mais configurações do BT (bluetooth) e alguns log que tu ve no monitor quando ele
+{                                                                                                           // ta pronto pra realizar uma conexão
     esp_hidd_event_t event = (esp_hidd_event_t)id;
     esp_hidd_event_data_t *param = (esp_hidd_event_data_t *)event_data;
     static const char *TAG = "HID_DEV_BT";
@@ -367,10 +688,10 @@ static void bt_hidd_event_callback(void *handler_args, esp_event_base_t base, in
 
     case ESP_HIDD_START_EVENT: {
 
-        if (param->start.status == ESP_OK) {
+        if (param->start.status == ESP_OK) { // Nesse caso o esp ta pronto para a conexão
 
             ESP_LOGI(TAG, "START OK");
-            ESP_LOGI(TAG, "Setting to connectable, discoverable");
+            ESP_LOGI(TAG, "Setting to connectable, discoverable"); // Isso a gente vê quando inicializa o monitor indicando ue ja da pra estabelecer a conexão
 
             esp_bt_gap_set_scan_mode(
                 ESP_BT_CONNECTABLE,
@@ -385,7 +706,7 @@ static void bt_hidd_event_callback(void *handler_args, esp_event_base_t base, in
         break;
     }
 
-    case ESP_HIDD_CONNECT_EVENT: {
+    case ESP_HIDD_CONNECT_EVENT: { // Nesse caso a conexão foi estabelecida
 
         if (param->connect.status == ESP_OK) {
 
@@ -397,9 +718,11 @@ static void bt_hidd_event_callback(void *handler_args, esp_event_base_t base, in
                 ESP_BT_NON_DISCOVERABLE
             );
 
-            bt_hid_task_start_up();
-            cursor_analog_teste_task_start();
-            botao_hall_teste_task_start();
+            ESP_LOGI(TAG, "Bluetooth conectado: iniciando sensores!");
+
+            cursor_analog_task_start(); // se criar uma nova task e não configurar e nem inicializar ela em algum case, ela nunca vai rodar
+            botao_hall_task_start();    // aqui nos temos as 2 que estamos usando, antigamente estava aqui também a task do exemplo deles
+            scroll_IR_task_start();
 
         } else {
 
@@ -409,7 +732,7 @@ static void bt_hidd_event_callback(void *handler_args, esp_event_base_t base, in
         break;
     }
 
-    case ESP_HIDD_PROTOCOL_MODE_EVENT: {
+    case ESP_HIDD_PROTOCOL_MODE_EVENT: { // Outros cases... Vale investigar exatamente o que são cada um
 
         ESP_LOGI(
             TAG,
@@ -498,87 +821,7 @@ static void bt_hidd_event_callback(void *handler_args, esp_event_base_t base, in
     return;
 }
 
-#if CONFIG_BT_SDP_COMMON_ENABLED
-
-static void esp_sdp_cb(esp_sdp_cb_event_t event, esp_sdp_cb_param_t *param)
-{
-    switch (event) {
-
-    case ESP_SDP_INIT_EVT:
-
-        ESP_LOGI(TAG, "ESP_SDP_INIT_EVT: status:%d", param->init.status);
-
-        if (param->init.status == ESP_SDP_SUCCESS) {
-
-            esp_bluetooth_sdp_dip_record_t dip_record = {
-                .hdr =
-                {
-                    .type = ESP_SDP_TYPE_DIP_SERVER,
-                },
-                .vendor = bt_hid_config.vendor_id,
-                .vendor_id_source = ESP_SDP_VENDOR_ID_SRC_BT,
-                .product = bt_hid_config.product_id,
-                .version = bt_hid_config.version,
-                .primary_record = true,
-            };
-
-            esp_sdp_create_record(
-                (esp_bluetooth_sdp_record_t *)&dip_record
-            );
-        }
-
-        break;
-
-    case ESP_SDP_DEINIT_EVT:
-
-        ESP_LOGI(
-            TAG,
-            "ESP_SDP_DEINIT_EVT: status:%d",
-            param->deinit.status
-        );
-
-        break;
-
-    case ESP_SDP_SEARCH_COMP_EVT:
-
-        ESP_LOGI(
-            TAG,
-            "ESP_SDP_SEARCH_COMP_EVT: status:%d",
-            param->search.status
-        );
-
-        break;
-
-    case ESP_SDP_CREATE_RECORD_COMP_EVT:
-
-        ESP_LOGI(
-            TAG,
-            "ESP_SDP_CREATE_RECORD_COMP_EVT: status:%d, handle:0x%x",
-            param->create_record.status,
-            param->create_record.record_handle
-        );
-
-        break;
-
-    case ESP_SDP_REMOVE_RECORD_COMP_EVT:
-
-        ESP_LOGI(
-            TAG,
-            "ESP_SDP_REMOVE_RECORD_COMP_EVT: status:%d",
-            param->remove_record.status
-        );
-
-        break;
-
-    default:
-        break;
-    }
-}
-
-#endif /* CONFIG_BT_SDP_COMMON_ENABLED */
-
-
-void app_main(void)
+void app_main(void) // aqui é a Main do código
 {
     esp_err_t ret;
 
@@ -624,11 +867,11 @@ void app_main(void)
 
     ESP_LOGI(TAG, "setting bt device");
 
-    ESP_ERROR_CHECK(
-        esp_hidd_dev_init(
+    ESP_ERROR_CHECK( // Aqui a Main inicializa bt_hid_event_callback
+        esp_hidd_dev_init( // que é a função verifica o estado da conexão e inicializa as tasks, comentarios e função a partir da linha: 299
             &bt_hid_config,
             ESP_HID_TRANSPORT_BT,
-            bt_hidd_event_callback,
+            bt_hidd_event_callback, // Aqui essa função e inicializada
             &s_bt_hid_param.hid_dev
         )
     );
@@ -643,4 +886,5 @@ void app_main(void)
 #endif /* CONFIG_BT_SDP_COMMON_ENABLED */
 
 #endif /* CONFIG_BT_HID_DEVICE_ENABLED */
+
 }
