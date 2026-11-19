@@ -102,6 +102,8 @@ int DESLOC_EIXO_X = 0;
 int DESLOC_EIXO_Y = 0;
 
 // Identificador da tarefa de leitura dos sensores IR
+static TaskHandle_t cursor_task_handle = NULL;
+static TaskHandle_t hall_task_handle = NULL;
 static TaskHandle_t ir_task_handle = NULL;
 
 // Envia um relatório HID: botoes, movimento X/Y e rolagem.
@@ -443,204 +445,13 @@ void cursor_analog(void *arg){
     }
 }
 
-//
-//// Função de leitura do joystick cursor
-//#define CENTRO_X 2048.0f // Valor central do eixo X do joystick
-//#define CENTRO_Y 2048.0f // Valor central do eixo Y do joystick
-//#define DEADZONE 0.2f //0.3121f // Valor da deadzone radial, 0.3121f corresponde a 32% do valor máximo do eixo (4095)
-//void cursor_analog(void *arg){
-//    adc_oneshot_unit_handle_t adc_handle_analog; // declara o identificador para unidade ADC
-//    adc_oneshot_unit_init_cfg_t init_config_analog = {.unit_id = ADC_UNIT_1, }; // Seleciona a unidade ADC1 do ESP-32
-//    adc_oneshot_new_unit( &init_config_analog, &adc_handle_analog); // inicia a unidade ADC selecionada e atribui o identificador
-//                                                                    // adc_handle_analog já declarado
-//    adc_oneshot_chan_cfg_t config_analog = { .bitwidth = ADC_BITWIDTH_12, .atten = ADC_ATTEN_DB_12, }; // Defnine configurações
-//                                                                        // de leitura dos canais: 12 bits (0 - 4095)
-//    adc_oneshot_config_channel( adc_handle_analog, ADC_CHANNEL_4, &config_analog); // Configura canal ADC4 para leitura analógica
-//    adc_oneshot_config_channel( adc_handle_analog, ADC_CHANNEL_5, &config_analog); // O mesmo para canal ADC5 - (Pinos GPIO: 32, 33)
-//
-//    int VALOR_X = 0;
-//    int VALOR_Y = 0;
-//    int RESTO_X = 0;
-//    int RESTO_Y = 0;
-//
-//    printf("X = %d | Y = %d\n", VALOR_X, VALOR_Y);
-//
-//    while(1){
-//        adc_oneshot_read(adc_handle_analog, ADC_CHANNEL_4, &VALOR_X); // Leitura do canal correspondente ao eixo X
-//        adc_oneshot_read(adc_handle_analog, ADC_CHANNEL_5, &VALOR_Y); // Leitura de Y
-//
-//        // Centralização e normalização
-//        float X = (VALOR_X - CENTRO_X) / CENTRO_X;
-//        float Y = (VALOR_Y - CENTRO_Y) / CENTRO_Y;
-//
-//        // Módulo do vetor
-//        float MODULO = sqrtf(X * X + Y * Y);
-//
-//        // Verificação da deadzone radial
-//        if (MODULO <= DEADZONE) {
-//            DESLOC_EIXO_X = 0;
-//            DESLOC_EIXO_Y = 0;
-//            RESTO_X = 0;
-//            RESTO_Y = 0;
-//
-//        } else {
-//            
-//            int INTENSIDADE;
-//
-//            if (MODULO < 0.3f) {
-//                INTENSIDADE = 1;
-//            } else if (MODULO < 0.4f) {
-//                INTENSIDADE = 2;
-//            } else if (MODULO < 0.5f) {
-//                INTENSIDADE = 3;
-//            } else if (MODULO < 0.6f) {
-//                INTENSIDADE = 4;
-//            } else if (MODULO < 0.7f) {
-//                INTENSIDADE = 5;
-//            } else if (MODULO < 0.8f) {
-//                INTENSIDADE = 6;
-//            } else if (MODULO < 0.9f) {
-//                INTENSIDADE = 7;
-//            } else if (MODULO < 0.95f) {
-//                INTENSIDADE = 8;
-//            } else {
-//                INTENSIDADE = 9;
-//            }
-//
-//            float PROPORCAO_X = ( X/MODULO)/ 9.f;
-//            float PROPORCAO_Y = ( Y/MODULO)/ 9.f;
-//            float MOD_PROPORCAO_X = sqrtf( PROPORCAO_X * PROPORCAO_X);
-//            float MOD_PROPORCAO_Y = sqrtf( PROPORCAO_Y * PROPORCAO_Y);
-//
-//            MOD_PROPORCAO_X *= INTENSIDADE;
-//            MOD_PROPORCAO_Y *= INTENSIDADE;
-//
-//            if( MOD_PROPORCAO_X >= 0.90f){
-//                DESLOC_EIXO_X = 9;
-//            } else if( MOD_PROPORCAO_X >= 0.80f){
-//                DESLOC_EIXO_X = 8;
-//            } else if( MOD_PROPORCAO_X >= 0.70f){
-//                DESLOC_EIXO_X = 7;
-//            } else if( MOD_PROPORCAO_X >= 0.60f){
-//                DESLOC_EIXO_X = 6;
-//            } else if( MOD_PROPORCAO_X >= 0.50f){
-//                DESLOC_EIXO_X = 5;
-//            } else if( MOD_PROPORCAO_X >= 0.40f){
-//                DESLOC_EIXO_X = 4;
-//            } else if( MOD_PROPORCAO_X >= 0.30f){
-//                DESLOC_EIXO_X = 3;
-//            } else if( MOD_PROPORCAO_X >= 0.20f){
-//                DESLOC_EIXO_X = 2;
-//            } else if( MOD_PROPORCAO_X > 0.10f){
-//                DESLOC_EIXO_X = 1;
-//            }
-//
-//            if( MOD_PROPORCAO_Y >= 0.90f){
-//                DESLOC_EIXO_Y = 9;
-//            } else if( MOD_PROPORCAO_Y >= 0.80f){
-//                DESLOC_EIXO_Y = 8;
-//            } else if( MOD_PROPORCAO_Y >= 0.70f){
-//                DESLOC_EIXO_Y = 7;
-//            } else if( MOD_PROPORCAO_Y >= 0.60f){
-//                DESLOC_EIXO_Y = 6;
-//            } else if( MOD_PROPORCAO_Y >= 0.50f){
-//                DESLOC_EIXO_Y = 5;
-//            } else if( MOD_PROPORCAO_Y >= 0.40f){
-//                DESLOC_EIXO_Y = 4;
-//            } else if( MOD_PROPORCAO_Y >= 0.30f){
-//                DESLOC_EIXO_Y = 3;
-//            } else if( MOD_PROPORCAO_Y >= 0.20f){
-//                DESLOC_EIXO_Y = 2;
-//            } else if( MOD_PROPORCAO_Y > 0.10f){
-//                DESLOC_EIXO_Y = 1;
-//            }
-//
-//            if( PROPORCAO_X < 0){
-//                DESLOC_EIXO_X = -DESLOC_EIXO_X;
-//            }
-//
-//            if( PROPORCAO_Y < 0){
-//                DESLOC_EIXO_Y = -DESLOC_EIXO_Y;
-//            }
-////
-////            DESLOC_EIXO_X += RESTO_X;
-////            DESLOC_EIXO_Y += RESTO_Y;
-////
-////            // Sentido negativo
-////            if (VALOR_Y <= 500){
-////                DESLOC_EIXO_Y = -3;
-////                RESTO_Y += VALOR_Y - 500;
-////
-////            } else if (VALOR_Y < 1000){
-////                DESLOC_EIXO_Y = -2;
-////                RESTO_Y += VALOR_Y - 1000;
-////
-////            } else if(VALOR_Y < 1500){
-////                DESLOC_EIXO_Y = -1;
-////                RESTO_Y += VALOR_Y - 1500;
-////
-////            } else if (VALOR_Y <= 2500){ // Zona morta
-////                DESLOC_EIXO_Y = 0;
-////                RESTO_Y = 0;
-////
-////            } else if (VALOR_Y <= 3000){ // Sentido positivo
-////                DESLOC_EIXO_Y = 1;
-////                RESTO_Y += VALOR_Y - 2501;
-////
-////            } else if (VALOR_Y <= 3500){
-////                DESLOC_EIXO_Y = 2;
-////                RESTO_Y += VALOR_Y - 3001;
-////
-////            } else if (VALOR_Y > 3500){
-////                DESLOC_EIXO_Y = 3;
-////                RESTO_Y += VALOR_Y - 3501;
-////
-////            }
-////
-////            // Sentido negativo
-////            if (VALOR_X <= 500){
-////                DESLOC_EIXO_X = -3;
-////                RESTO_X += VALOR_X - 500;
-////
-////            } else if (VALOR_X < 1000){
-////                DESLOC_EIXO_X = -2;
-////                RESTO_X += VALOR_X - 1000;
-////
-////            } else if(VALOR_X < 1500){
-////                DESLOC_EIXO_X = -1;
-////                RESTO_X += VALOR_X - 1500;
-////
-////            } else if (VALOR_X <= 2500){ // Zona morta
-////                DESLOC_EIXO_X = 0;
-////                RESTO_X = 0;
-////
-////            } else if (VALOR_X <= 3000){ // Sentido positivo
-////                DESLOC_EIXO_X = 1;
-////                RESTO_X += VALOR_X - 2501;
-////
-////            } else if (VALOR_X <= 3500){
-////                DESLOC_EIXO_X = 2;
-////                RESTO_X += VALOR_X - 3001;
-////
-////            } else if (VALOR_X > 3500){
-////                DESLOC_EIXO_X = 3;
-////                RESTO_X += VALOR_X - 3501;
-////
-////            }
-//        }
-//        
-//        send_mouse(BOTOES, DESLOC_EIXO_X, DESLOC_EIXO_Y, 0);
-//        vTaskDelay(10 / portTICK_PERIOD_MS); // Libera CPU por no mínimo 10 ms
-//    }
-//}
-//
 void cursor_analog_task_start(void){ // Configuração da task cursor_analog_teste
-    xTaskCreate(cursor_analog, "cursor_analog", 2 * 1024, NULL, configMAX_PRIORITIES - 3, NULL);
+    xTaskCreate(cursor_analog, "cursor_analog", 2 * 1024, NULL, configMAX_PRIORITIES - 3, &cursor_task_handle);
     return;
 }
 
 void botao_hall_task_start(void){ // Configuração da task botao_hall_teste | dps tem que tirar esse "teste" do nome delas kkk
-    xTaskCreate( botao_hall, "botao_hall", 2 * 1024, NULL, configMAX_PRIORITIES - 3, NULL);
+    xTaskCreate( botao_hall, "botao_hall", 2 * 1024, NULL, configMAX_PRIORITIES - 3, &hall_task_handle);
     return;
 }
 
@@ -653,14 +464,7 @@ void scroll_IR_task_start(void)
         return;
     }
 
-    BaseType_t resultado = xTaskCreate(
-        scroll_IR,
-        "scroll_IR",
-        3072,
-        NULL,
-        5,
-        &ir_task_handle
-    );
+    BaseType_t resultado = xTaskCreate( scroll_IR, "scroll_IR", 3072, NULL, 5, &ir_task_handle);
 
     if (resultado == pdPASS) {
         printf("[IR] Tarefa criada com sucesso!\n");
@@ -669,14 +473,32 @@ void scroll_IR_task_start(void)
         printf("[IR] ERRO: nao foi possivel criar a tarefa!\n");
     }
 }
-
-void bt_hid_task_shut_down(void) // aqui faz parte do exemplo mas acho que é o procedimento quando tu encerra a conexão bluetooth, seta as flags que são lidas em outros trechos do código
-{                                // É uma função não uma task
-    if (s_bt_hid_param.task_hdl) {
+// Funções para o encerramento das task | são chamadas dentro dos cases de event
+void bt_hid_task_shut_down(void){ // aqui faz parte do exemplo mas acho que é o procedimento quando tu encerra                                
+    if (s_bt_hid_param.task_hdl) { // a conexão bluetooth
         vTaskDelete(s_bt_hid_param.task_hdl);
         s_bt_hid_param.task_hdl = NULL;
     }
 }
+
+void sensores_task_stop(void){
+    if( cursor_task_handle != NULL){
+        vTaskDelete( cursor_task_handle);
+        cursor_task_handle = NULL;
+    }
+
+    if( hall_task_handle != NULL){
+        vTaskDelete( hall_task_handle);
+        hall_task_handle = NULL;
+    }
+
+    if( ir_task_handle != NULL){
+        vTaskDelete( ir_task_handle);
+        ir_task_handle = NULL;
+    }
+}
+
+
 
 static void bt_hidd_event_callback(void *handler_args, esp_event_base_t base, int32_t id, void *event_data) // Mais configurações do BT (bluetooth) e alguns log que tu ve no monitor quando ele
 {                                                                                                           // ta pronto pra realizar uma conexão
@@ -790,6 +612,7 @@ static void bt_hidd_event_callback(void *handler_args, esp_event_base_t base, in
 
             ESP_LOGI(TAG, "DISCONNECT OK");
 
+            sensores_task_stop();
             bt_hid_task_shut_down();
 
             ESP_LOGI(TAG, "Setting to connectable, discoverable again");
